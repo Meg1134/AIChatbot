@@ -31,7 +31,7 @@ class ChatbotAgent:
             "model": model_name,
             "temperature": 0.7,
             'base_url': settings.openai_base_url,
-            'default_headers': "{'x-foo': 'true'}",
+            'default_headers': {'x-foo': 'true'},
         }
 
         

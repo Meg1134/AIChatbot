@@ -2,6 +2,7 @@
 FastAPI 后端服务
 """
 import asyncio
+from contextlib import asynccontextmanager
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,11 +17,41 @@ from src.mcp import MCPServer
 # 设置环境变量
 setup_environment()
 
+# 全局变量
+chatbot_agent = None
+mcp_server = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理"""
+    global chatbot_agent, mcp_server
+    
+    try:
+        # 初始化聊天机器人
+        chatbot_agent = ChatbotAgent()
+        print("✅ 聊天机器人初始化完成")
+        
+        # 启动 MCP 服务器
+        mcp_server = MCPServer(host="localhost", port=8765)
+        asyncio.create_task(mcp_server.start())
+        print("✅ MCP 服务器启动完成")
+        
+    except Exception as e:
+        print(f"❌ 启动时出错: {e}")
+    
+    yield
+    
+    # 清理资源（如果需要的话）
+    print("🧹 清理资源...")
+
+
 # 创建 FastAPI 应用
 app = FastAPI(
     title="AI 聊天机器人 API",
     description="基于 LangChain、LangGraph、MCP 和 RAG 的智能聊天机器人",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 # 添加 CORS 中间件
@@ -31,10 +62,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# 全局变量
-chatbot_agent = None
-mcp_server = None
 
 
 # Pydantic 模型
@@ -61,26 +88,6 @@ class HealthResponse(BaseModel):
     status: str
     version: str
     components: dict
-
-
-# 启动事件
-@app.on_event("startup")
-async def startup_event():
-    """应用启动时的初始化"""
-    global chatbot_agent, mcp_server
-    
-    try:
-        # 初始化聊天机器人
-        chatbot_agent = ChatbotAgent()
-        print("✅ 聊天机器人初始化完成")
-        
-        # 启动 MCP 服务器
-        mcp_server = MCPServer(host="localhost", port=8765)
-        asyncio.create_task(mcp_server.start())
-        print("✅ MCP 服务器启动完成")
-        
-    except Exception as e:
-        print(f"❌ 启动时出错: {e}")
 
 
 @app.get("/", response_model=dict)
