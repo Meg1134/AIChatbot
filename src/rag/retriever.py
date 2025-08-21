@@ -12,16 +12,26 @@ class RAGRetriever(BaseRetriever):
     
     def __init__(self, vector_store_manager: VectorStoreManager, k: int = 4):
         """初始化检索器"""
+        super().__init__()
         self.vector_store_manager = vector_store_manager
         self.k = k
     
-    def get_relevant_documents(self, query: str) -> List[Document]:
-        """获取相关文档"""
+    def _get_relevant_documents(self, query: str) -> List[Document]:
+        """获取相关文档（新的抽象方法实现）"""
         return self.vector_store_manager.similarity_search(query, k=self.k)
     
+    async def _aget_relevant_documents(self, query: str) -> List[Document]:
+        """异步获取相关文档（新的抽象方法实现）"""
+        return self._get_relevant_documents(query)
+    
+    # 保留兼容性方法
+    def get_relevant_documents(self, query: str) -> List[Document]:
+        """获取相关文档（兼容性方法）"""
+        return self._get_relevant_documents(query)
+    
     async def aget_relevant_documents(self, query: str) -> List[Document]:
-        """异步获取相关文档"""
-        return self.get_relevant_documents(query)
+        """异步获取相关文档（兼容性方法）"""
+        return await self._aget_relevant_documents(query)
     
     def get_relevant_documents_with_scores(self, query: str) -> List[tuple]:
         """获取带分数的相关文档"""
