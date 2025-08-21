@@ -4,126 +4,133 @@ MCP 客户端
 import asyncio
 import websockets
 from typing import Any, Dict, Optional
+import logging
 from .protocol import MCPProtocol, MCPMessage
 
+logger = logging.getLogger(__name__)
 
 class MCPClient:
     """MCP 客户端"""
-    
-    def __init__(self, server_url: str):
-        """初始化客户端"""
+
+    def __init__(self, server_url: str, auto_reconnect: bool = False, reconnect_interval: int = 5):
         self.server_url = server_url
         self.protocol = MCPProtocol()
-        self.websocket = None
+        self.websocket: Optional[websockets.WebSocketClientProtocol] = None
         self.pending_requests: Dict[str, asyncio.Future] = {}
-    
+        self._recv_task: Optional[asyncio.Task] = None
+        self.auto_reconnect = auto_reconnect
+        self.reconnect_interval = reconnect_interval
+        self._closing = False
+
+    async def __aenter__(self):
+        await self.connect()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.disconnect()
+
     async def connect(self):
-        """连接到服务器"""
+        if self.websocket and not self.websocket.closed:
+            return
         try:
             self.websocket = await websockets.connect(self.server_url)
-            print(f"已连接到 MCP 服务器: {self.server_url}")
-            
-            # 启动消息处理循环
-            asyncio.create_task(self._message_loop())
-            
+            logger.info("已连接 MCP 服务器: %s", self.server_url)
+            self._recv_task = asyncio.create_task(self._message_loop())
         except Exception as e:
-            print(f"连接到服务器失败: {e}")
+            logger.error("连接失败: %s", e)
             raise
-    
+
     async def disconnect(self):
-        """断开连接"""
+        self._closing = True
         if self.websocket:
             await self.websocket.close()
-            self.websocket = None
-            print("已断开与 MCP 服务器的连接")
-    
-    async def send_request(self, method: str, params: Optional[Dict[str, Any]] = None, 
-                          timeout: float = 30.0) -> Any:
-        """发送请求并等待响应"""
-        if not self.websocket:
+        if self._recv_task:
+            self._recv_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._recv_task
+        # 取消未完成请求
+        for fut in self.pending_requests.values():
+            if not fut.done():
+                fut.set_exception(ConnectionError("连接已关闭"))
+        self.pending_requests.clear()
+        logger.info("已断开 MCP 服务器连接")
+
+    async def send_request(self, method: str, params: Optional[Dict[str, Any]] = None, timeout: float = 30.0) -> Any:
+        if not self.websocket or self.websocket.closed:
             raise ConnectionError("未连接到服务器")
-        
-        # 创建请求消息
         request = self.protocol.create_request(method, params)
-        
-        # 创建 Future 等待响应
-        future = asyncio.Future()
-        self.pending_requests[request.id] = future
-        
+        fut = asyncio.get_event_loop().create_future()
+        self.pending_requests[request.id] = fut
         try:
-            # 发送请求
-            message_data = self.protocol.serialize_message(request)
-            await self.websocket.send(message_data)
-            
-            # 等待响应
-            result = await asyncio.wait_for(future, timeout=timeout)
-            return result
-            
-        except asyncio.TimeoutError:
-            # 清理超时的请求
+            await self.websocket.send(self.protocol.serialize_message(request))
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except Exception:
             self.pending_requests.pop(request.id, None)
-            raise asyncio.TimeoutError(f"请求超时: {method}")
-        
-        except Exception as e:
-            # 清理失败的请求
-            self.pending_requests.pop(request.id, None)
-            raise e
-    
+            raise
+
     async def send_notification(self, method: str, params: Optional[Dict[str, Any]] = None):
-        """发送通知"""
-        if not self.websocket:
+        if not self.websocket or self.websocket.closed:
             raise ConnectionError("未连接到服务器")
-        
         notification = self.protocol.create_notification(method, params)
-        message_data = self.protocol.serialize_message(notification)
-        await self.websocket.send(message_data)
-    
+        await self.websocket.send(self.protocol.serialize_message(notification))
+
     async def _message_loop(self):
-        """消息处理循环"""
         try:
-            async for message in self.websocket:
-                await self._handle_message(message)
-                
+            async for raw in self.websocket:
+                await self._handle_message(raw)
         except websockets.exceptions.ConnectionClosed:
-            print("与服务器的连接已关闭")
+            logger.warning("服务器关闭连接")
+            await self._on_disconnect()
         except Exception as e:
-            print(f"消息循环出错: {e}")
-    
-    async def _handle_message(self, raw_message: str):
-        """处理接收到的消息"""
+            logger.error("消息循环异常: %s", e)
+            await self._on_disconnect()
+
+    async def _on_disconnect(self):
+        if self._closing:
+            return
+        # 拒绝所有挂起请求
+        for fut in self.pending_requests.values():
+            if not fut.done():
+                fut.set_exception(ConnectionError("连接丢失"))
+        self.pending_requests.clear()
+        if self.auto_reconnect:
+            await asyncio.sleep(self.reconnect_interval)
+            try:
+                await self.connect()
+            except Exception:
+                logger.error("重连失败，稍后再试")
+                asyncio.create_task(self._delayed_reconnect())
+
+    async def _delayed_reconnect(self):
+        await asyncio.sleep(self.reconnect_interval)
         try:
-            message_data = self.protocol.deserialize_message(raw_message)
-            message = MCPMessage(**message_data)
-            
-            if message.type in ["response", "error"] and message.id:
-                # 处理响应消息
-                future = self.pending_requests.pop(message.id, None)
-                if future and not future.done():
-                    if message.type == "response":
-                        future.set_result(message.result)
+            await self.connect()
+        except Exception:
+            asyncio.create_task(self._delayed_reconnect())
+
+    async def _handle_message(self, raw: str):
+        try:
+            data = self.protocol.deserialize_message(raw)
+            msg = MCPMessage(**data)
+            if msg.type in ("response", "error") and msg.id:
+                fut = self.pending_requests.pop(msg.id, None)
+                if fut and not fut.done():
+                    if msg.type == "response":
+                        fut.set_result(msg.result)
                     else:
-                        error_msg = message.error.get("message", "Unknown error")
-                        future.set_exception(Exception(error_msg))
-            
-            elif message.type == "notification":
-                # 处理通知消息
-                await self._handle_notification(message)
-                
+                        fut.set_exception(Exception(msg.error.get("message", "Unknown error")))
+            elif msg.type == "notification":
+                await self._handle_notification(msg)
         except Exception as e:
-            print(f"处理消息时出错: {e}")
-    
+            logger.error("处理消息失败: %s", e)
+
     async def _handle_notification(self, message: MCPMessage):
-        """处理通知消息"""
-        # 客户端可以在这里处理来自服务器的通知
-        print(f"收到通知: {message.method}, 参数: {message.params}")
-    
-    # 便捷方法示例
-    async def get_model_info(self) -> Dict[str, Any]:
-        """获取模型信息"""
+        logger.info("收到通知: %s %s", message.method, message.params)
+
+    async def get_model_info(self):
         return await self.send_request("model.info")
-    
-    async def generate_text(self, prompt: str, **kwargs) -> str:
-        """生成文本"""
+
+    async def generate_text(self, prompt: str, **kwargs):
         params = {"prompt": prompt, **kwargs}
         result = await self.send_request("model.generate", params)
         return result.get("text", "")

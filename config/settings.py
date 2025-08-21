@@ -4,6 +4,7 @@
 import os
 from typing import Optional
 from pydantic_settings import BaseSettings
+import json
 
 
 class Settings(BaseSettings):
@@ -12,7 +13,7 @@ class Settings(BaseSettings):
     # OpenAI API 配置
     openai_api_key: str = ""
     openai_base_url: Optional[str] = None
-    openai_default_headers: Optional[str] = None
+    openai_default_headers: Optional[dict] = None
     openai_model: str = "gpt-3.5-turbo"
     
     # LangChain 配置
@@ -52,8 +53,8 @@ def setup_environment():
     if settings.openai_base_url:
         os.environ["OPENAI_BASE_URL"] = settings.openai_base_url
         
-    if settings.openai_default_headers:
-        os.environ["OPENAI_DEFAULT_HEADERS"] = settings.openai_default_headers
+    # if settings.openai_default_headers:
+    #     os.environ["OPENAI_DEFAULT_HEADERS"] = json.dumps(settings.openai_default_headers)
     
     if settings.langchain_api_key:
         os.environ["LANGCHAIN_API_KEY"] = settings.langchain_api_key
